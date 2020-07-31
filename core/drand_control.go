@@ -46,7 +46,7 @@ func (d *Drand) InitDKG(c context.Context, in *drand.InitDKGPacket) (*drand.Grou
 	d.log.Info("init_dkg", "begin", "time", d.opts.clock.Now().Unix(), "leader", true)
 
 	// setup the manager
-	newSetup := func() (*setupManager, error) {
+	newSetup := func(d *Drand) (*setupManager, error) {
 		return newDKGSetup(d.log, d.opts.clock, d.priv.Public, in.GetBeaconPeriod(), in.GetCatchupPeriod(), in.GetInfo())
 	}
 
@@ -69,14 +69,14 @@ func (d *Drand) InitDKG(c context.Context, in *drand.InitDKGPacket) (*drand.Grou
 	return finalGroup.ToProto(), nil
 }
 
-func (d *Drand) leaderRunSetup(newSetup func() (*setupManager, error)) (group *key.Group, err error) {
+func (d *Drand) leaderRunSetup(newSetup func(d *Drand) (*setupManager, error)) (group *key.Group, err error) {
 	// setup the manager
 	d.state.Lock()
 	if d.manager != nil {
 		d.log.Info("reshare", "already_in_progress", "restart", "reshare", "old")
 		d.manager.StopPreemptively()
 	}
-	manager, err := newSetup()
+	manager, err := newSetup(d)
 	d.log.Info("reshare", "newmanager")
 	if err != nil {
 		d.state.Unlock()
@@ -143,13 +143,14 @@ func (d *Drand) runDKG(leader bool, group *key.Group, timeout uint32, randomness
 	}
 
 	d.state.Lock()
-	d.dkgInfo = &dkgInfo{
+	dkgInfo := &dkgInfo{
 		target: group,
 		board:  board,
 		phaser: phaser,
 		conf:   config,
 		proto:  dkgProto,
 	}
+	d.dkgInfo = dkgInfo
 	if leader {
 		d.dkgInfo.started = true
 	}
@@ -165,15 +166,28 @@ func (d *Drand) runDKG(leader bool, group *key.Group, timeout uint32, randomness
 	finalGroup, err := d.WaitDKG()
 	if err != nil {
 		d.log.Error("init_dkg", err)
+		d.state.Lock()
+		if d.dkgInfo == dkgInfo {
+			d.cleanupDKG()
+		}
+		d.state.Unlock()
 		return nil, fmt.Errorf("drand: %v", err)
 	}
 	d.state.Lock()
+	d.cleanupDKG()
 	d.dkgDone = true
 	d.state.Unlock()
 	d.log.Info("init_dkg", "dkg_done", "starting_beacon_time", finalGroup.GenesisTime, "now", d.opts.clock.Now().Unix())
 	// beacon will start at the genesis time specified
 	go d.StartBeacon(false)
 	return finalGroup, nil
+}
+
+func (d *Drand) cleanupDKG() {
+	if d.dkgInfo != nil {
+		d.dkgInfo.board.stop()
+	}
+	d.dkgInfo = nil
 }
 
 // runResharing setups all necessary structures to run the resharing protocol
@@ -258,6 +272,11 @@ func (d *Drand) runResharing(leader bool, oldGroup, newGroup *key.Group, timeout
 	d.log.Info("dkg_reshare", "wait_dkg_end")
 	finalGroup, err := d.WaitDKG()
 	if err != nil {
+		d.state.Lock()
+		if d.dkgInfo == info {
+			d.cleanupDKG()
+		}
+		d.state.Unlock()
 		return nil, fmt.Errorf("drand: err during DKG: %v", err)
 	}
 	d.log.Info("dkg_reshare", "finished", "leader", leader)
@@ -489,7 +508,7 @@ func (d *Drand) InitReshare(c context.Context, in *drand.InitResharePacket) (*dr
 
 	d.log.Info("init_reshare", "begin", "leader", true, "time", d.opts.clock.Now())
 
-	newSetup := func() (*setupManager, error) {
+	newSetup := func(d *Drand) (*setupManager, error) {
 		return newReshareSetup(d.log, d.opts.clock, d.priv.Public, oldGroup, in)
 	}
 
